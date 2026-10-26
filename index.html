@@ -215,6 +215,7 @@ function lsGet(k,d){try{var v=localStorage.getItem(k);return v?JSON.parse(v):(k 
 function lsSet(k,v){mem[k]=v;try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
 
 var log=lsGet('fc_log',[]);
+var dels=lsGet('fc_del',[]);
 var cfg=Object.assign({focus:25,short:5,long:15,every:4,auto:false,chime:true},lsGet('fc_cfg',{}));
 var gh=Object.assign({repo:'Sanketjoag/focus-log',path:'focus-log.json',branch:'main',token:'',auto:false},lsGet('fc_gh',{}));
 var snd=Object.assign({type:'off',vol:40,onlyFocus:false},lsGet('fc_snd',{}));
@@ -465,7 +466,7 @@ $('#sStats').addEventListener('click',function(e){
   var r=e.target.closest('[data-r]');if(r){rangeIdx=+r.dataset.r;renderStats();return}
   var c=e.target.closest('[data-cal]');if(c){calSpan=+c.dataset.cal;renderStats();return}
   var d=e.target.closest('[data-day]');if(d){selDay=d.dataset.day;renderStats();$('#dayPick').scrollIntoView({behavior:'smooth',block:'center'});return}
-  var x=e.target.closest('[data-del]');if(x){log=log.filter(function(l){return l.id!==x.dataset.del});saveLog();render()}
+  var x=e.target.closest('[data-del]');if(x){dels.push(x.dataset.del);lsSet('fc_del',dels);log=log.filter(function(l){return l.id!==x.dataset.del});saveLog();render();if(gh.auto&&gh.token)ghPush(true)}
 });
 $('#dayPick').onchange=function(){if(this.value){selDay=this.value;renderStats()}};
 $('#dayToday').onclick=function(){selDay=dkey(new Date());renderStats()};
@@ -557,22 +558,26 @@ function chime(){
 function download(name,text,type){
   var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:type}));a.download=name;document.body.appendChild(a);a.click();a.remove();
 }
-function payload(){return JSON.stringify({version:1,exportedAt:new Date().toISOString(),settings:cfg,log:log},null,1)}
+function payload(){return JSON.stringify({version:1,exportedAt:new Date().toISOString(),settings:cfg,log:log,deleted:dels},null,1)}
 $('#exJson').onclick=function(){download('focus-log.json',payload(),'application/json')};
 $('#exCsv').onclick=function(){
   var rows=['date,time,type,seconds,status'];
   log.slice().sort(function(a,b){return a.t-b.t}).forEach(function(e){var d=new Date(e.t);rows.push([dkey(d),pad(d.getHours())+':'+pad(d.getMinutes()),e.k,e.s,e.m?'manual':e.c?'completed':'partial'].join(','))});
   download('focus-log.csv',rows.join('\n'),'text/csv');
 };
-function mergeLog(incoming){
+function mergeLog(src){
+  var incoming=Array.isArray(src)?src:((src&&src.log)||[]);
+  ((src&&src.deleted)||[]).forEach(function(id){if(dels.indexOf(id)<0)dels.push(id)});
+  lsSet('fc_del',dels);
+  log=log.filter(function(e){return dels.indexOf(e.id)<0});
   var seen={};log.forEach(function(e){seen[e.id]=1});var added=0;
-  (incoming||[]).forEach(function(e){if(e&&e.id&&!seen[e.id]){log.push(e);seen[e.id]=1;added++}});
+  incoming.forEach(function(e){if(e&&e.id&&!seen[e.id]&&dels.indexOf(e.id)<0){log.push(e);seen[e.id]=1;added++}});
   saveLog();return added;
 }
 $('#imBtn').onclick=function(){$('#imFile').click()};
 $('#imFile').onchange=function(){
   var f=this.files[0];if(!f)return;var r=new FileReader();
-  r.onload=function(){try{var j=JSON.parse(r.result);var n=mergeLog(j.log);ghMsg('Imported '+n+' new entries.',true);render()}catch(e){ghMsg('That file is not a valid focus log.',false)}};
+  r.onload=function(){try{var j=JSON.parse(r.result);var n=mergeLog(j);ghMsg('Imported '+n+' new entries.',true);render()}catch(e){ghMsg('That file is not a valid focus log.',false)}};
   r.readAsText(f);this.value='';
 };
 function loadGhUI(){$('#ghRepo').value=gh.repo;$('#ghPath').value=gh.path;$('#ghBranch').value=gh.branch;$('#ghToken').value=gh.token;$('#ghAuto').checked=gh.auto}
@@ -596,7 +601,7 @@ async function ghPush(quiet){
   try{
     if(!quiet)ghMsg('Pushing...',true);
     var cur=await ghGet();
-    if(cur){try{mergeLog(JSON.parse(b64d(cur.content)).log)}catch(e){}}
+    if(cur){try{mergeLog(JSON.parse(b64d(cur.content)))}catch(e){}}
     var body={message:'Update focus log '+new Date().toISOString().slice(0,16).replace('T',' '),content:b64e(payload()),branch:gh.branch};
     if(cur)body.sha=cur.sha;
     var r=await fetch(ghUrl(),{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},ghHeaders()),body:JSON.stringify(body)});
@@ -611,7 +616,7 @@ async function ghPull(){
     ghMsg('Pulling...',true);
     var cur=await ghGet();
     if(!cur){ghMsg('No file at that path yet. Push first to create it.',false);return}
-    var n=mergeLog(JSON.parse(b64d(cur.content)).log);
+    var n=mergeLog(JSON.parse(b64d(cur.content)));
     ghMsg('Merged '+n+' new entries from GitHub.',true);render();
   }catch(e){ghMsg('Pull failed: '+e.message+'. Calls to GitHub only work from GitHub Pages or a local copy.',false)}
 }
@@ -619,6 +624,20 @@ $('#ghPush').onclick=function(){ghPush(false)};
 $('#ghPull').onclick=ghPull;
 
 var bg=$("#bg");bg.play&&bg.play().catch(function(){document.addEventListener("click",function(){bg.play()},{once:true})});
+async function ghAuto(){
+  if(!gh.repo||!gh.token)return;
+  try{
+    var cur=await ghGet();
+    if(cur){
+      var remote=JSON.parse(b64d(cur.content));
+      mergeLog(remote);render();
+      if(gh.auto&&log.length!==(remote.log||[]).length)ghPush(true);
+    }else if(gh.auto&&log.length){ghPush(true)}
+    ghMsg('Synced at '+new Date().toLocaleTimeString()+'.',true);
+  }catch(e){ghMsg('Auto sync failed: '+e.message,false)}
+}
+ghAuto();
+document.addEventListener('visibilitychange',function(){if(!document.hidden)ghAuto()});
 render();
 })();
 </script>
